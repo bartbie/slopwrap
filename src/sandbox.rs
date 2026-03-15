@@ -14,6 +14,8 @@ pub struct SandboxConfig {
     pub upperdir: PathBuf,
     pub workdir: PathBuf,
     pub no_net: bool,
+    pub ro_binds: Vec<PathBuf>,
+    pub rw_binds: Vec<PathBuf>,
     pub command: Vec<String>,
 }
 
@@ -138,6 +140,16 @@ impl SandboxConfig {
             }
         }
 
+        // Extra user-specified binds
+        for p in &self.ro_binds {
+            let s = p.to_string_lossy().to_string();
+            args.extend(["--ro-bind".into(), s.clone(), s]);
+        }
+        for p in &self.rw_binds {
+            let s = p.to_string_lossy().to_string();
+            args.extend(["--bind".into(), s.clone(), s]);
+        }
+
         // Repo overlay
         let repo = self.repo_root.to_string_lossy().to_string();
         let upper = self.upperdir.to_string_lossy().to_string();
@@ -178,6 +190,8 @@ mod tests {
             upperdir: PathBuf::from("/tmp/overlay/upper"),
             workdir: PathBuf::from("/tmp/overlay/work"),
             no_net,
+            ro_binds: vec![],
+            rw_binds: vec![],
             command: vec!["bash".into()],
         }
     }
@@ -243,6 +257,35 @@ mod tests {
         assert!(args.contains(&"--die-with-parent".to_string()));
     }
 
+    #[test]
+    fn ro_bind_appears_in_args() {
+        let mut cfg = make_config(false);
+        cfg.ro_binds = vec![PathBuf::from("/tmp/myconfig")];
+        let args = cfg.build_args();
+        let idx = args.iter().position(|a| a == "/tmp/myconfig").unwrap();
+        assert_eq!(args[idx - 1], "--ro-bind");
+    }
+
+    #[test]
+    fn rw_bind_appears_in_args() {
+        let mut cfg = make_config(false);
+        cfg.rw_binds = vec![PathBuf::from("/tmp/mystate")];
+        let args = cfg.build_args();
+        let idx = args.iter().position(|a| a == "/tmp/mystate").unwrap();
+        assert_eq!(args[idx - 1], "--bind");
+    }
+
+    #[test]
+    fn multiple_binds_all_present() {
+        let mut cfg = make_config(false);
+        cfg.ro_binds = vec![PathBuf::from("/tmp/a"), PathBuf::from("/tmp/b")];
+        cfg.rw_binds = vec![PathBuf::from("/tmp/c")];
+        let args = cfg.build_args();
+        assert!(args.contains(&"/tmp/a".to_string()));
+        assert!(args.contains(&"/tmp/b".to_string()));
+        assert!(args.contains(&"/tmp/c".to_string()));
+    }
+
     // --- Property-based tests ---
 
     fn arb_path(u: &mut arbtest::arbitrary::Unstructured) -> arbtest::arbitrary::Result<PathBuf> {
@@ -255,12 +298,19 @@ mod tests {
         Ok(PathBuf::from(s))
     }
 
+    fn arb_paths(u: &mut arbtest::arbitrary::Unstructured) -> arbtest::arbitrary::Result<Vec<PathBuf>> {
+        let len: usize = u.int_in_range(0..=3)?;
+        (0..len).map(|_| arb_path(u)).collect()
+    }
+
     fn arb_config(u: &mut arbtest::arbitrary::Unstructured) -> arbtest::arbitrary::Result<SandboxConfig> {
         Ok(SandboxConfig {
             repo_root: arb_path(u)?,
             upperdir: arb_path(u)?,
             workdir: arb_path(u)?,
             no_net: u.arbitrary()?,
+            ro_binds: arb_paths(u)?,
+            rw_binds: arb_paths(u)?,
             command: vec!["test-cmd".into()],
         })
     }

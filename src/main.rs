@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "slopwrap", about = "Sandbox AI tools with bubblewrap")]
+#[command(name = "slopwrap", about = "Sandbox AI tools with bubblewrap", trailing_var_arg = true)]
 struct Cli {
     /// Disable network access inside the sandbox.
     #[arg(long)]
@@ -19,12 +19,32 @@ struct Cli {
     #[arg(long)]
     overlay_dir: Option<PathBuf>,
 
+    /// Directory where sandbox writes land (overlayfs upper). Overrides overlay-dir layout.
+    #[arg(long)]
+    output_dir: Option<PathBuf>,
+
+    /// Overlayfs workdir. Overrides overlay-dir layout.
+    #[arg(long)]
+    work_dir: Option<PathBuf>,
+
     /// Keep the overlay directory after exit (default on Ctrl-C).
     #[arg(long)]
     keep: bool,
 
+    /// Bind-mount a path read-only into the sandbox (repeatable).
+    #[arg(long = "ro-bind", value_name = "PATH")]
+    ro_binds: Vec<PathBuf>,
+
+    /// Bind-mount a path read-write into the sandbox (repeatable).
+    #[arg(long = "bind", value_name = "PATH")]
+    rw_binds: Vec<PathBuf>,
+
+    /// Bind ~/.claude (rw) for Claude Code support.
+    #[arg(long)]
+    claude: bool,
+
     /// Command and arguments to run inside the sandbox.
-    #[arg(last = true, required = true)]
+    #[arg(required = true)]
     command: Vec<String>,
 }
 
@@ -104,7 +124,21 @@ fn run() -> Result<i32> {
         _tmpdir = Some(td);
     }
 
-    let dirs = overlay::setup(&overlay_base)?;
+    let dirs = match (&cli.output_dir, &cli.work_dir) {
+        (Some(out), Some(work)) => overlay::setup_explicit(out, work)?,
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("--output-dir and --work-dir must be used together");
+        }
+        (None, None) => overlay::setup(&overlay_base)?,
+    };
+
+    // Expand --claude into concrete binds
+    let ro_binds = cli.ro_binds;
+    let mut rw_binds = cli.rw_binds;
+    if cli.claude {
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        rw_binds.push(PathBuf::from(format!("{home}/.claude")));
+    }
 
     // Build and run bwrap
     let config = sandbox::SandboxConfig {
@@ -112,6 +146,8 @@ fn run() -> Result<i32> {
         upperdir: dirs.upperdir.clone(),
         workdir: dirs.workdir.clone(),
         no_net: cli.no_net,
+        ro_binds,
+        rw_binds,
         command: cli.command,
     };
 
@@ -131,6 +167,9 @@ fn run() -> Result<i32> {
 
     let status = child.wait().context("waiting for bwrap")?;
     let exit_code = status.code().unwrap_or(1);
+
+    // Fix overlayfs d--------- permissions so cleanup can remove the tree
+    overlay::fix_overlay_permissions(&overlay_base);
 
     // Post-session diff
     let summary = diff::summarize(&dirs.upperdir, &repo_root)?;

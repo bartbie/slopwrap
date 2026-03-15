@@ -70,12 +70,23 @@
             '';
           };
 
+          # Test binaries built by naersk, to run inside the VM
+          packages.test-bins = naersk'.buildPackage {
+            src = ./.;
+            cargoBuildOptions = x: x ++ [ "--tests" ];
+            postInstall = ''
+              find target/release/deps -maxdepth 1 -type f -executable ! -name '*.d' \
+                -exec cp {} $out/bin/ \;
+            '';
+          };
+
           checks.vm-test = pkgs.testers.nixosTest {
             name = "slopwrap-integration";
 
             nodes.machine = { pkgs, ... }: {
               environment.systemPackages = [
                 self.packages.${system}.default
+                self.packages.${system}.test-bins
                 pkgs.bubblewrap
                 pkgs.diffutils
                 pkgs.curl
@@ -91,57 +102,20 @@
 
             testScript = ''
               machine.wait_for_unit("multi-user.target")
-              machine.succeed("mkdir -p /home/testuser/repo && echo original > /home/testuser/repo/file.txt && chown -R testuser: /home/testuser")
 
-              # --- Isolation: touch inside sandbox does not affect real repo ---
-              machine.succeed(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep -- touch /home/testuser/repo/newfile'"
-              )
-              machine.fail("test -f /home/testuser/repo/newfile")
+              # TMPDIR must be outside /tmp — the sandbox mounts --tmpfs /tmp
+              # which hides any repo path under it from the overlay mount.
+              machine.succeed("su - testuser -c 'mkdir -p /home/testuser/tmp'")
 
-              # --- Isolation: rm inside sandbox does not affect real repo ---
-              machine.succeed(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep -- rm /home/testuser/repo/file.txt'"
-              )
-              machine.succeed("test -f /home/testuser/repo/file.txt")
-
-              # --- Hostname is slopwrap (UTS isolation) ---
-              result = machine.succeed(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep -- hostname'"
-              )
-              assert "slopwrap" in result, f"expected 'slopwrap' in hostname output, got: {result}"
-
-              # --- /etc/resolv.conf is accessible ---
-              machine.succeed(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep -- cat /etc/resolv.conf'"
-              )
-
-              # --- --no-net blocks network ---
-              machine.fail(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep --no-net -- curl -s --max-time 3 https://example.com'"
-              )
-
-              # --- Exit code forwarding: 0 ---
-              machine.succeed(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep -- true'"
-              )
-
-              # --- Exit code forwarding: nonzero ---
-              machine.fail(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep -- false'"
-              )
-
-              # --- Custom overlay-dir: changes land in specified location ---
-              machine.succeed("su - testuser -c 'mkdir -p /home/testuser/my-overlay'")
-              machine.succeed(
-                "su - testuser -c 'cd /home/testuser/repo && slopwrap --keep --overlay-dir /home/testuser/my-overlay -- bash -c \"echo hello > /home/testuser/repo/overlay_test.txt\"'"
-              )
-              machine.succeed("test -f /home/testuser/my-overlay/upper/overlay_test.txt")
-              machine.fail("test -f /home/testuser/repo/overlay_test.txt")
-
-              # --- Original file content preserved after sandbox modifications ---
-              result = machine.succeed("cat /home/testuser/repo/file.txt")
-              assert "original" in result, f"expected 'original', got: {result}"
+              # Run the Rust integration tests (#[ignore]d ones that need bwrap).
+              # Test binary names have a hash suffix from cargo.
+              for test_bin in ["sandbox", "overlay", "exit_code"]:
+                  machine.succeed(
+                      f"su - testuser -c 'TMPDIR=/home/testuser/tmp"
+                      f" $(ls /run/current-system/sw/bin/{test_bin}-* | head -1)"
+                      f" --ignored --test-threads=1'",
+                      timeout=60,
+                  )
             '';
           };
 

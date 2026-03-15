@@ -2,8 +2,11 @@ use assert_cmd::Command;
 use assert_fs::prelude::*;
 use predicates::prelude::*;
 
+// cargo_bin works locally (cargo test), PATH fallback for VM test
+// where pre-built test binaries run without cargo.
 fn slopwrap() -> Command {
-    Command::cargo_bin("slopwrap").unwrap()
+    Command::cargo_bin("slopwrap")
+        .unwrap_or_else(|_| Command::new("slopwrap"))
 }
 
 #[test]
@@ -16,7 +19,7 @@ fn ls_repo_contents() {
         .args(["--keep", "--"])
         .arg("ls")
         .arg(repo.path())
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("hello.txt"));
@@ -37,7 +40,7 @@ fn touch_does_not_modify_real_repo() {
             "touch",
         ])
         .arg(repo.path().join("newfile"))
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .success();
 
@@ -60,7 +63,7 @@ fn rm_does_not_affect_real_repo() {
             "rm",
         ])
         .arg(repo.path().join("keep_me.txt"))
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .success();
 
@@ -74,7 +77,7 @@ fn resolv_conf_accessible() {
 
     slopwrap()
         .args(["--keep", "--", "cat", "/etc/resolv.conf"])
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .success();
 }
@@ -86,7 +89,7 @@ fn hostname_is_slopwrap() {
 
     slopwrap()
         .args(["--keep", "--", "hostname"])
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .success()
         .stdout(predicate::str::contains("slopwrap"));
@@ -108,7 +111,7 @@ fn no_net_blocks_network() {
             "3",
             "https://example.com",
         ])
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .failure();
 }

@@ -11,11 +11,17 @@ pub struct OverlayDirs {
 
 /// Create overlay directories (upperdir and workdir) under `base`.
 pub fn setup(base: &Path) -> Result<OverlayDirs> {
-    let upperdir = base.join("upper");
-    let workdir = base.join("work");
-    fs::create_dir_all(&upperdir).context("creating upperdir")?;
-    fs::create_dir_all(&workdir).context("creating workdir")?;
-    Ok(OverlayDirs { upperdir, workdir })
+    setup_explicit(&base.join("upper"), &base.join("work"))
+}
+
+/// Create overlay directories at explicit paths.
+pub fn setup_explicit(upperdir: &Path, workdir: &Path) -> Result<OverlayDirs> {
+    fs::create_dir_all(upperdir).context("creating output dir")?;
+    fs::create_dir_all(workdir).context("creating work dir")?;
+    Ok(OverlayDirs {
+        upperdir: upperdir.to_path_buf(),
+        workdir: workdir.to_path_buf(),
+    })
 }
 
 /// Check if a file is an overlayfs whiteout (char device 0,0).
@@ -172,9 +178,28 @@ pub fn apply(upperdir: &Path, repo: &Path) -> Result<()> {
 }
 
 /// Discard overlay by removing the base directory.
+/// Overlayfs sets d--------- on its internal workdir, so we fix permissions first.
 pub fn discard(base: &Path) -> Result<()> {
+    fix_overlay_permissions(base);
     fs::remove_dir_all(base).context("removing overlay directory")?;
     Ok(())
+}
+
+/// Recursively chmod directories that overlayfs left with no permissions.
+pub fn fix_overlay_permissions(base: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let Ok(entries) = fs::read_dir(base) else { return };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if let Ok(meta) = fs::symlink_metadata(&path) {
+            if meta.is_dir() && meta.permissions().mode() & 0o700 == 0 {
+                fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).ok();
+            }
+            if meta.is_dir() {
+                fix_overlay_permissions(&path);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

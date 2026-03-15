@@ -1,7 +1,10 @@
 use assert_cmd::Command;
 
+// cargo_bin works locally (cargo test), PATH fallback for VM test
+// where pre-built test binaries run without cargo.
 fn slopwrap() -> Command {
-    Command::cargo_bin("slopwrap").unwrap()
+    Command::cargo_bin("slopwrap")
+        .unwrap_or_else(|_| Command::new("slopwrap"))
 }
 
 #[test]
@@ -11,7 +14,7 @@ fn exit_code_zero() {
 
     slopwrap()
         .args(["--keep", "--", "true"])
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .success();
 }
@@ -23,7 +26,7 @@ fn exit_code_nonzero() {
 
     slopwrap()
         .args(["--keep", "--", "bash", "-c", "exit 42"])
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .code(42);
 }
@@ -35,7 +38,7 @@ fn exit_code_from_false() {
 
     slopwrap()
         .args(["--keep", "--", "false"])
-        .env("PWD", repo.path())
+        .current_dir(repo.path())
         .assert()
         .code(1);
 }

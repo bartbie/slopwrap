@@ -115,3 +115,38 @@ fn no_net_blocks_network() {
         .assert()
         .failure();
 }
+
+#[test]
+#[ignore] // requires bwrap
+fn claude_flag_exposes_claude_json() {
+    let repo = assert_fs::TempDir::new().unwrap();
+    let home = std::env::var("HOME").unwrap();
+    let claude_json = std::path::PathBuf::from(&home).join(".claude.json");
+
+    // Skip if user doesn't have .claude.json
+    if !claude_json.exists() {
+        return;
+    }
+
+    slopwrap()
+        .args(["--keep", "--claude", "--", "cat"])
+        .arg(&claude_json)
+        .current_dir(repo.path())
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore] // requires bwrap
+fn claude_flag_keeps_rest_of_config_ro() {
+    let repo = assert_fs::TempDir::new().unwrap();
+    let home = std::env::var("HOME").unwrap();
+
+    // Try to write to a non-claude path under .config — should fail
+    slopwrap()
+        .args(["--keep", "--claude", "--", "touch"])
+        .arg(format!("{home}/.config/slopwrap-test-sentinel"))
+        .current_dir(repo.path())
+        .assert()
+        .failure();
+}

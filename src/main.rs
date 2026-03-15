@@ -104,6 +104,25 @@ enum Action {
     Keep,
 }
 
+/// Expand --claude into concrete bind paths.
+/// Checks $HOME/.config/claude, $HOME/.claude, and $HOME/.claude.json.
+fn claude_binds(home: &str) -> Vec<PathBuf> {
+    let mut binds = Vec::new();
+    let config_claude = PathBuf::from(format!("{home}/.config/claude"));
+    if config_claude.exists() {
+        binds.push(config_claude);
+    }
+    let dot_claude = PathBuf::from(format!("{home}/.claude"));
+    if dot_claude.exists() {
+        binds.push(dot_claude);
+    }
+    let claude_json = PathBuf::from(format!("{home}/.claude.json"));
+    if claude_json.exists() {
+        binds.push(claude_json);
+    }
+    binds
+}
+
 fn run() -> Result<i32> {
     let cli = Cli::parse();
 
@@ -137,7 +156,7 @@ fn run() -> Result<i32> {
     let mut rw_binds = cli.rw_binds;
     if cli.claude {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
-        rw_binds.push(PathBuf::from(format!("{home}/.claude")));
+        rw_binds.extend(claude_binds(&home));
     }
 
     // Build and run bwrap
@@ -224,5 +243,72 @@ fn main() {
             eprintln!("slopwrap: {e:#}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn claude_binds_includes_dot_claude_when_exists() {
+        let fake_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir(fake_home.path().join(".claude")).unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(binds.contains(&fake_home.path().join(".claude")));
+    }
+
+    #[test]
+    fn claude_binds_omits_dot_claude_when_missing() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(!binds.contains(&fake_home.path().join(".claude")));
+    }
+
+    #[test]
+    fn claude_binds_includes_config_claude_when_exists() {
+        let fake_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fake_home.path().join(".config/claude")).unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(binds.contains(&fake_home.path().join(".config/claude")));
+    }
+
+    #[test]
+    fn claude_binds_omits_config_claude_when_missing() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(!binds.contains(&fake_home.path().join(".config/claude")));
+    }
+
+    #[test]
+    fn claude_binds_includes_claude_json_when_exists() {
+        let fake_home = tempfile::tempdir().unwrap();
+        std::fs::write(fake_home.path().join(".claude.json"), "{}").unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(binds.contains(&fake_home.path().join(".claude.json")));
+    }
+
+    #[test]
+    fn claude_binds_omits_claude_json_when_missing() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(!binds.contains(&fake_home.path().join(".claude.json")));
+    }
+
+    #[test]
+    fn claude_binds_includes_all_when_all_exist() {
+        let fake_home = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(fake_home.path().join(".config/claude")).unwrap();
+        std::fs::create_dir(fake_home.path().join(".claude")).unwrap();
+        std::fs::write(fake_home.path().join(".claude.json"), "{}").unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert_eq!(binds.len(), 3);
+    }
+
+    #[test]
+    fn claude_binds_empty_when_nothing_exists() {
+        let fake_home = tempfile::tempdir().unwrap();
+        let binds = claude_binds(fake_home.path().to_str().unwrap());
+        assert!(binds.is_empty());
     }
 }

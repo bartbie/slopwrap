@@ -51,19 +51,26 @@
             src = ./.;
           };
 
-          # Unit + property tests in nix sandbox (fixed seed for reproducibility)
-          checks.unit = pkgs.runCommand "slopwrap-unit-tests" {
-            nativeBuildInputs = [ toolchain pkgs.pkg-config ];
+          checks.unit = naersk'.buildPackage {
             src = ./.;
-          } ''
-            cp -r $src/* .
-            export HOME=$(mktemp -d)
-            export ARBTEST_SEED=''${SLOPWRAP_TEST_SEED:-12345}
-            cargo test -- --test-threads=1
-            touch $out
-          '';
+            doCheck = true;
+            cargoTestOptions = x: x ++ [ "--" "--test-threads=1" ];
+          };
 
-          checks.vm-test = pkgs.nixosTest {
+          checks.property-random = naersk'.buildPackage {
+            src = ./.;
+            doCheck = true;
+            cargoTestOptions = x: x ++ [ "prop_" "--" "--test-threads=1" ];
+            ARBTEST_BUDGET_MS = "500";
+            postCheck = ''
+              for i in 2 3 4 5; do
+                echo "=== property run $i/5 ==="
+                ARBTEST_BUDGET_MS=500 cargo test prop_ -- --test-threads=1
+              done
+            '';
+          };
+
+          checks.vm-test = pkgs.testers.nixosTest {
             name = "slopwrap-integration";
 
             nodes.machine = { pkgs, ... }: {
@@ -137,6 +144,36 @@
               assert "original" in result, f"expected 'original', got: {result}"
             '';
           };
+
+          packages.slopwrap-fuzz = pkgs.writeShellScriptBin "slopwrap-fuzz" ''
+            set -uo pipefail
+            RUNS=''${1:-10}
+            TIMEOUT=''${2:-60}
+            FAILED=0
+            FAIL_ITERS=""
+            echo "Running slopwrap property tests ($RUNS iterations, 5 seeds each)..."
+            for i in $(seq 1 "$RUNS"); do
+              echo "=== iteration $i/$RUNS ==="
+              OUTPUT=$(timeout "$TIMEOUT" nix build .#checks.${system}.property-random --rebuild 2>&1) || {
+                if echo "$OUTPUT" | grep -q "not valid, so checking is not possible"; then
+                  timeout "$TIMEOUT" nix build .#checks.${system}.property-random 2>&1 || {
+                    FAILED=$((FAILED + 1))
+                    FAIL_ITERS="$FAIL_ITERS $i"
+                  }
+                else
+                  echo "$OUTPUT"
+                  FAILED=$((FAILED + 1))
+                  FAIL_ITERS="$FAIL_ITERS $i"
+                fi
+              }
+            done
+            if [ "$FAILED" -gt 0 ]; then
+              echo "FAILED $FAILED/$RUNS iterations (iterations:$FAIL_ITERS)"
+              echo "Reproduce with ARBTEST_SEED=<hex> cargo test <test_name>"
+              exit 1
+            fi
+            echo "All $RUNS iterations passed ($(( RUNS * 5 )) total runs)."
+          '';
 
           devShells.default = pkgs.mkShell {
             nativeBuildInputs = [

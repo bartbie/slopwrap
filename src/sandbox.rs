@@ -46,9 +46,16 @@ impl SandboxConfig {
         // System (read-only)
         args.extend(["--ro-bind".into(), "/usr".into(), "/usr".into()]);
 
-        // /nix if it exists
+        // NixOS: /nix store and /run/current-system (provides /run/current-system/sw/bin)
         if Path::new("/nix").exists() {
             args.extend(["--ro-bind".into(), "/nix".into(), "/nix".into()]);
+        }
+        if Path::new("/run/current-system").exists() {
+            args.extend([
+                "--ro-bind".into(),
+                "/run/current-system".into(),
+                "/run/current-system".into(),
+            ]);
         }
 
         // FHS symlinks
@@ -84,7 +91,7 @@ impl SandboxConfig {
             }
         }
         // Optional /etc paths
-        for etc_file in &["alternatives", "profile.d"] {
+        for etc_file in &["alternatives", "profile.d", "profiles"] {
             let p = format!("/etc/{etc_file}");
             if Path::new(&p).exists() {
                 args.extend(["--ro-bind".into(), p.clone(), p]);

@@ -60,6 +60,13 @@ pub fn is_opaque_dir(path: &Path) -> bool {
         };
         let attr_name = c"trusted.overlay.opaque";
         let mut buf = [0u8; 2];
+        // SAFETY:
+        // Needed to detect overlayfs opaque dirs (full directory replacements vs merges),
+        // without which deleted-and-replaced dirs would be silently treated as modifications.
+        // lgetxattr reads the xattr without following symlinks; no stdlib xattr API exists.
+        //
+        // cpath is a valid NUL-terminated CString, attr_name is a C string literal,
+        // and buf is a stack-allocated [u8; 2] with len passed to bound the read.
         let ret = unsafe {
             libc::lgetxattr(
                 cpath.as_ptr(),

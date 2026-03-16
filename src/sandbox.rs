@@ -16,6 +16,7 @@ pub struct SandboxConfig {
     pub no_net: bool,
     pub ro_binds: Vec<PathBuf>,
     pub rw_binds: Vec<PathBuf>,
+    pub env_passthrough: Vec<(String, String)>,
     pub command: Vec<String>,
 }
 
@@ -34,6 +35,37 @@ impl SandboxConfig {
             "--hostname".into(),
             "slopwrap".into(),
         ]);
+
+        // Environment isolation: clear inherited env, set safe subset
+        args.push("--clearenv".into());
+        for (key, val) in [
+            ("HOME", home.clone()),
+            (
+                "USER",
+                std::env::var("USER").unwrap_or_else(|_| "nobody".into()),
+            ),
+            (
+                "PATH",
+                std::env::var("PATH").unwrap_or_else(|_| "/usr/bin:/bin".into()),
+            ),
+            (
+                "TERM",
+                std::env::var("TERM").unwrap_or_else(|_| "xterm".into()),
+            ),
+            (
+                "LANG",
+                std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".into()),
+            ),
+            (
+                "SHELL",
+                std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".into()),
+            ),
+        ] {
+            args.extend(["--setenv".into(), key.into(), val]);
+        }
+        for (key, val) in &self.env_passthrough {
+            args.extend(["--setenv".into(), key.clone(), val.clone()]);
+        }
 
         // /dev, /proc, /tmp
         args.extend([
@@ -86,6 +118,8 @@ impl SandboxConfig {
             "hosts",
             "nsswitch.conf",
             "localtime",
+            "passwd",
+            "group",
         ] {
             let p = format!("/etc/{etc_file}");
             if Path::new(&p).exists() {
@@ -116,26 +150,39 @@ impl SandboxConfig {
             .map(|p| PathBuf::from(&home).join(p))
             .collect();
 
-        // ro-bind-try for config/local
+        // ro-bind-try for config/local, with tmpfs overlays hiding blocked children
         for dot in &[".config", ".local"] {
-            let src = format!("{home}/{dot}");
-            if !is_blocked(&PathBuf::from(&src), &blocked) {
-                args.extend(["--ro-bind-try".into(), src.clone(), src]);
+            let src = PathBuf::from(format!("{home}/{dot}"));
+            if is_directly_blocked(&src, &blocked) {
+                continue;
+            }
+            let src_str = src.to_string_lossy().to_string();
+            args.extend(["--ro-bind-try".into(), src_str.clone(), src_str]);
+            for child in blocked_children(&src, &blocked) {
+                if child.exists() {
+                    args.extend(["--tmpfs".into(), child.to_string_lossy().to_string()]);
+                }
             }
         }
 
         // bind-try (writable) for cache
         {
-            let src = format!("{home}/.cache");
-            if !is_blocked(&PathBuf::from(&src), &blocked) {
-                args.extend(["--bind-try".into(), src.clone(), src]);
+            let src = PathBuf::from(format!("{home}/.cache"));
+            if !is_directly_blocked(&src, &blocked) {
+                let src_str = src.to_string_lossy().to_string();
+                args.extend(["--bind-try".into(), src_str.clone(), src_str]);
+                for child in blocked_children(&src, &blocked) {
+                    if child.exists() {
+                        args.extend(["--tmpfs".into(), child.to_string_lossy().to_string()]);
+                    }
+                }
             }
         }
 
         // ro-bind-try for shell/git config
         for dot in &[".bashrc", ".profile", ".gitconfig"] {
             let src = format!("{home}/{dot}");
-            if !is_blocked(&PathBuf::from(&src), &blocked) {
+            if !is_directly_blocked(&PathBuf::from(&src), &blocked) {
                 args.extend(["--ro-bind-try".into(), src.clone(), src]);
             }
         }
@@ -174,10 +221,17 @@ impl SandboxConfig {
     }
 }
 
-fn is_blocked(path: &Path, blocked: &[PathBuf]) -> bool {
+/// True when `path` itself is blocked or is a descendant of a blocked dir.
+fn is_directly_blocked(path: &Path, blocked: &[PathBuf]) -> bool {
+    blocked.iter().any(|b| path == b || path.starts_with(b))
+}
+
+/// Returns blocked paths that are strict children of `path`.
+fn blocked_children<'a>(path: &Path, blocked: &'a [PathBuf]) -> Vec<&'a PathBuf> {
     blocked
         .iter()
-        .any(|b| path == b || path.starts_with(b) || b.starts_with(path))
+        .filter(|b| b.starts_with(path) && *b != path)
+        .collect()
 }
 
 #[cfg(test)]
@@ -192,9 +246,19 @@ mod tests {
             no_net,
             ro_binds: vec![],
             rw_binds: vec![],
+            env_passthrough: vec![],
             command: vec!["bash".into()],
         }
     }
+
+    /// True when `path` follows a bind-mount flag in `args`.
+    fn is_bind_mounted_in(path: &str, args: &[String]) -> bool {
+        let bind_flags = ["--ro-bind", "--bind", "--ro-bind-try", "--bind-try"];
+        args.windows(2)
+            .any(|w| bind_flags.contains(&w[0].as_str()) && w[1] == path)
+    }
+
+    // --- existing tests (updated) ---
 
     #[test]
     fn default_args_contain_unshare_all() {
@@ -216,14 +280,14 @@ mod tests {
     }
 
     #[test]
-    fn blocked_paths_never_in_args() {
+    fn blocked_paths_never_bind_mounted() {
         let args = make_config(false).build_args();
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         for blocked in BLOCKED_PATHS {
             let full = format!("{home}/{blocked}");
             assert!(
-                !args.contains(&full),
-                "blocked path {full} found in args"
+                !is_bind_mounted_in(&full, &args),
+                "blocked path {full} is bind-mounted"
             );
         }
     }
@@ -286,6 +350,185 @@ mod tests {
         assert!(args.contains(&"/tmp/c".to_string()));
     }
 
+    // --- is_directly_blocked / blocked_children ---
+
+    #[test]
+    fn blocked_child_does_not_block_parent() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        let config = PathBuf::from(format!("{home}/.config"));
+        assert!(!is_directly_blocked(&config, &blocked));
+    }
+
+    #[test]
+    fn blocked_child_is_still_blocked() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        let gcloud = PathBuf::from(format!("{home}/.config/gcloud"));
+        assert!(is_directly_blocked(&gcloud, &blocked));
+    }
+
+    #[test]
+    fn blocked_exact_match() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        assert!(is_directly_blocked(
+            &PathBuf::from(format!("{home}/.ssh")),
+            &blocked,
+        ));
+    }
+
+    #[test]
+    fn blocked_descendant() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        assert!(is_directly_blocked(
+            &PathBuf::from(format!("{home}/.ssh/keys/id_rsa")),
+            &blocked,
+        ));
+    }
+
+    #[test]
+    fn unrelated_path_not_blocked() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        assert!(!is_directly_blocked(
+            &PathBuf::from(format!("{home}/.local")),
+            &blocked,
+        ));
+    }
+
+    #[test]
+    fn config_has_gcloud_as_blocked_child() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        let config = PathBuf::from(format!("{home}/.config"));
+        let children = blocked_children(&config, &blocked);
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0],
+            &PathBuf::from(format!("{home}/.config/gcloud"))
+        );
+    }
+
+    #[test]
+    fn ssh_has_no_blocked_children() {
+        let home = "/home/test";
+        let blocked: Vec<PathBuf> = BLOCKED_PATHS
+            .iter()
+            .map(|p| PathBuf::from(home).join(p))
+            .collect();
+        // .ssh is directly blocked — not a parent with blocked children
+        assert!(blocked_children(&PathBuf::from(format!("{home}/.ssh")), &blocked).is_empty());
+    }
+
+    // --- --clearenv / env isolation ---
+
+    #[test]
+    fn clearenv_present_in_args() {
+        let args = make_config(false).build_args();
+        assert!(args.contains(&"--clearenv".to_string()));
+    }
+
+    #[test]
+    fn home_setenv_in_args() {
+        let args = make_config(false).build_args();
+        let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
+        assert!(
+            args.windows(3)
+                .any(|w| w[0] == "--setenv" && w[1] == "HOME" && w[2] == home),
+            "expected --setenv HOME {home}"
+        );
+    }
+
+    #[test]
+    fn path_setenv_in_args() {
+        let args = make_config(false).build_args();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--setenv" && w[1] == "PATH"),
+            "expected --setenv PATH"
+        );
+    }
+
+    #[test]
+    fn term_setenv_in_args() {
+        let args = make_config(false).build_args();
+        assert!(
+            args.windows(2).any(|w| w[0] == "--setenv" && w[1] == "TERM"),
+            "expected --setenv TERM"
+        );
+    }
+
+    #[test]
+    fn dbus_not_in_setenv() {
+        let args = make_config(false).build_args();
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--setenv" && w[1] == "DBUS_SESSION_BUS_ADDRESS"),
+            "DBUS_SESSION_BUS_ADDRESS must not leak into sandbox"
+        );
+    }
+
+    #[test]
+    fn display_not_in_setenv() {
+        let args = make_config(false).build_args();
+        assert!(
+            !args
+                .windows(2)
+                .any(|w| w[0] == "--setenv" && (w[1] == "DISPLAY" || w[1] == "WAYLAND_DISPLAY")),
+            "DISPLAY/WAYLAND_DISPLAY must not leak into sandbox"
+        );
+    }
+
+    #[test]
+    fn env_passthrough_appears_in_args() {
+        let mut cfg = make_config(false);
+        cfg.env_passthrough = vec![("MY_VAR".into(), "my_val".into())];
+        let args = cfg.build_args();
+        assert!(args.windows(3).any(|w| w[0] == "--setenv"
+            && w[1] == "MY_VAR"
+            && w[2] == "my_val"));
+    }
+
+    // --- /etc/passwd and /etc/group ---
+
+    #[test]
+    fn passwd_in_etc_mounts() {
+        if !Path::new("/etc/passwd").exists() {
+            return;
+        }
+        let args = make_config(false).build_args();
+        assert!(args.contains(&"/etc/passwd".to_string()));
+    }
+
+    #[test]
+    fn group_in_etc_mounts() {
+        if !Path::new("/etc/group").exists() {
+            return;
+        }
+        let args = make_config(false).build_args();
+        assert!(args.contains(&"/etc/group".to_string()));
+    }
+
     // --- Property-based tests ---
 
     fn arb_path(u: &mut arbtest::arbitrary::Unstructured) -> arbtest::arbitrary::Result<PathBuf> {
@@ -298,12 +541,16 @@ mod tests {
         Ok(PathBuf::from(s))
     }
 
-    fn arb_paths(u: &mut arbtest::arbitrary::Unstructured) -> arbtest::arbitrary::Result<Vec<PathBuf>> {
+    fn arb_paths(
+        u: &mut arbtest::arbitrary::Unstructured,
+    ) -> arbtest::arbitrary::Result<Vec<PathBuf>> {
         let len: usize = u.int_in_range(0..=3)?;
         (0..len).map(|_| arb_path(u)).collect()
     }
 
-    fn arb_config(u: &mut arbtest::arbitrary::Unstructured) -> arbtest::arbitrary::Result<SandboxConfig> {
+    fn arb_config(
+        u: &mut arbtest::arbitrary::Unstructured,
+    ) -> arbtest::arbitrary::Result<SandboxConfig> {
         Ok(SandboxConfig {
             repo_root: arb_path(u)?,
             upperdir: arb_path(u)?,
@@ -311,12 +558,13 @@ mod tests {
             no_net: u.arbitrary()?,
             ro_binds: arb_paths(u)?,
             rw_binds: arb_paths(u)?,
+            env_passthrough: vec![],
             command: vec!["test-cmd".into()],
         })
     }
 
     #[test]
-    fn prop_blocked_paths_never_in_args() {
+    fn prop_blocked_paths_never_bind_mounted() {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         arbtest::arbtest(|u| {
             let cfg = arb_config(u)?;
@@ -324,8 +572,8 @@ mod tests {
             for blocked in BLOCKED_PATHS {
                 let full = format!("{home}/{blocked}");
                 assert!(
-                    !args.contains(&full),
-                    "blocked path {full} found in args"
+                    !is_bind_mounted_in(&full, &args),
+                    "blocked path {full} is bind-mounted"
                 );
             }
             Ok(())
@@ -352,6 +600,39 @@ mod tests {
                 assert!(!args.contains(&"--share-net".to_string()));
             } else {
                 assert!(args.contains(&"--share-net".to_string()));
+            }
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prop_clearenv_always_present() {
+        arbtest::arbtest(|u| {
+            let cfg = arb_config(u)?;
+            let args = cfg.build_args();
+            assert!(args.contains(&"--clearenv".to_string()));
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn prop_no_env_leak() {
+        let forbidden = [
+            "DBUS_SESSION_BUS_ADDRESS",
+            "DISPLAY",
+            "WAYLAND_DISPLAY",
+            "XDG_RUNTIME_DIR",
+        ];
+        arbtest::arbtest(|u| {
+            let cfg = arb_config(u)?;
+            let args = cfg.build_args();
+            for var in &forbidden {
+                assert!(
+                    !args
+                        .windows(2)
+                        .any(|w| w[0] == "--setenv" && w[1] == *var),
+                    "forbidden env var {var} leaked into --setenv"
+                );
             }
             Ok(())
         });

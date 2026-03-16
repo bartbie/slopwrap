@@ -105,23 +105,44 @@ enum Action {
 }
 
 /// Expand --claude into concrete bind paths.
-/// Checks $HOME/.config/claude, $HOME/.claude, and $HOME/.claude.json.
+/// Creates ~/.claude if missing (credential storage).
+/// Warns if ~/.claude.json is absent (onboarding gate).
 fn claude_binds(home: &str) -> Vec<PathBuf> {
     let mut binds = Vec::new();
     let config_claude = PathBuf::from(format!("{home}/.config/claude"));
     if config_claude.exists() {
         binds.push(config_claude);
     }
+
+    // Always provide .claude dir — create if absent so bind mount has a target
     let dot_claude = PathBuf::from(format!("{home}/.claude"));
-    if dot_claude.exists() {
-        binds.push(dot_claude);
+    if !dot_claude.exists() {
+        std::fs::create_dir_all(&dot_claude).ok();
     }
+    binds.push(dot_claude);
+
+    // .claude.json holds the onboarding gate; without it Claude Code
+    // forces interactive auth regardless of env vars or credentials.
     let claude_json = PathBuf::from(format!("{home}/.claude.json"));
+    if !claude_json.exists() {
+        eprintln!(
+            "slopwrap: ~/.claude.json not found — run `claude` outside the sandbox first to complete onboarding."
+        );
+    }
     if claude_json.exists() {
         binds.push(claude_json);
     }
+
     binds
 }
+
+/// Claude-specific env vars to pass through when --claude is set.
+const CLAUDE_ENV_VARS: &[&str] = &[
+    "ANTHROPIC_API_KEY",
+    "CLAUDE_CODE_API_KEY",
+    "CLAUDE_CODE_OAUTH_TOKEN",
+    "CLAUDE_CONFIG_DIR",
+];
 
 fn run() -> Result<i32> {
     let cli = Cli::parse();
@@ -151,12 +172,18 @@ fn run() -> Result<i32> {
         (None, None) => overlay::setup(&overlay_base)?,
     };
 
-    // Expand --claude into concrete binds
+    // Expand --claude into concrete binds and env passthrough
     let ro_binds = cli.ro_binds;
     let mut rw_binds = cli.rw_binds;
+    let mut env_passthrough = Vec::new();
     if cli.claude {
         let home = std::env::var("HOME").unwrap_or_else(|_| "/root".into());
         rw_binds.extend(claude_binds(&home));
+        for var in CLAUDE_ENV_VARS {
+            if let Ok(val) = std::env::var(var) {
+                env_passthrough.push((var.to_string(), val));
+            }
+        }
     }
 
     // Build and run bwrap
@@ -167,6 +194,7 @@ fn run() -> Result<i32> {
         no_net: cli.no_net,
         ro_binds,
         rw_binds,
+        env_passthrough,
         command: cli.command,
     };
 
@@ -259,10 +287,12 @@ mod tests {
     }
 
     #[test]
-    fn claude_binds_omits_dot_claude_when_missing() {
+    fn claude_binds_creates_and_includes_dot_claude_when_missing() {
         let fake_home = tempfile::tempdir().unwrap();
+        assert!(!fake_home.path().join(".claude").exists());
         let binds = claude_binds(fake_home.path().to_str().unwrap());
-        assert!(!binds.contains(&fake_home.path().join(".claude")));
+        assert!(fake_home.path().join(".claude").exists());
+        assert!(binds.contains(&fake_home.path().join(".claude")));
     }
 
     #[test]
@@ -306,9 +336,11 @@ mod tests {
     }
 
     #[test]
-    fn claude_binds_empty_when_nothing_exists() {
+    fn claude_binds_only_dot_claude_when_nothing_else_exists() {
         let fake_home = tempfile::tempdir().unwrap();
         let binds = claude_binds(fake_home.path().to_str().unwrap());
-        assert!(binds.is_empty());
+        // .claude is always created and included
+        assert_eq!(binds.len(), 1);
+        assert!(binds.contains(&fake_home.path().join(".claude")));
     }
 }

@@ -150,3 +150,76 @@ fn claude_flag_keeps_rest_of_config_ro() {
         .assert()
         .failure();
 }
+
+#[test]
+#[ignore] // requires bwrap
+fn env_is_minimal() {
+    let repo = assert_fs::TempDir::new().unwrap();
+
+    slopwrap()
+        .args(["--keep", "--", "bash", "-c", "env"])
+        .current_dir(repo.path())
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("DBUS_SESSION_BUS_ADDRESS").not())
+        .stdout(predicate::str::contains("WAYLAND_DISPLAY").not())
+        .stdout(predicate::str::contains("XDG_RUNTIME_DIR").not());
+}
+
+#[test]
+#[ignore] // requires bwrap
+fn etc_passwd_readable() {
+    if !std::path::Path::new("/etc/passwd").exists() {
+        return;
+    }
+    let repo = assert_fs::TempDir::new().unwrap();
+
+    slopwrap()
+        .args(["--keep", "--", "cat", "/etc/passwd"])
+        .current_dir(repo.path())
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore] // requires bwrap
+fn etc_group_readable() {
+    if !std::path::Path::new("/etc/group").exists() {
+        return;
+    }
+    let repo = assert_fs::TempDir::new().unwrap();
+
+    slopwrap()
+        .args(["--keep", "--", "cat", "/etc/group"])
+        .current_dir(repo.path())
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore] // requires bwrap
+fn claude_flag_dot_claude_always_mounted() {
+    let repo = assert_fs::TempDir::new().unwrap();
+    let home = std::env::var("HOME").unwrap();
+
+    slopwrap()
+        .args(["--keep", "--claude", "--", "ls"])
+        .arg(format!("{home}/.claude/"))
+        .current_dir(repo.path())
+        .assert()
+        .success();
+}
+
+#[test]
+#[ignore] // requires bwrap
+fn claude_flag_credentials_writable() {
+    let repo = assert_fs::TempDir::new().unwrap();
+    let home = std::env::var("HOME").unwrap();
+
+    slopwrap()
+        .args(["--keep", "--claude", "--", "touch"])
+        .arg(format!("{home}/.claude/test-write-sentinel"))
+        .current_dir(repo.path())
+        .assert()
+        .success();
+}
